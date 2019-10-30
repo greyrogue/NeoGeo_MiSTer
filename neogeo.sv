@@ -77,6 +77,11 @@ module emu
 	output  [1:0] LED_POWER,
 	output  [1:0] LED_DISK,
 
+	// I/O board button press simulation (active high)
+	// b[1]: user button
+	// b[0]: osd button
+	output  [1:0] BUTTONS,
+
 	output [15:0] AUDIO_L,
 	output [15:0] AUDIO_R,
 	output        AUDIO_S,   // 1 - signed audio samples, 0 - unsigned
@@ -85,7 +90,7 @@ module emu
 	//ADC
 	inout   [3:0] ADC_BUS,
 
-	// SD-SPI
+	//SD-SPI
 	output        SD_SCK,
 	output        SD_MOSI,
 	input         SD_MISO,
@@ -155,10 +160,10 @@ module emu
 	// Open-drain User port.
 	// 0 - D+/RX
 	// 1 - D-/TX
-	// 2..5 - USR1..USR4
+	// 2..6 - USR2..USR6
 	// Set USER_OUT to 1 to read from USER_IN.
-	input   [5:0] USER_IN,
-	output  [5:0] USER_OUT,
+	input   [6:0] USER_IN,
+	output  [6:0] USER_OUT,
 
 	input         OSD_STATUS
 );
@@ -176,6 +181,7 @@ assign AUDIO_R = snd_right;
 assign LED_USER  = status[0];
 assign LED_DISK  = 0;
 assign LED_POWER = 0;
+assign BUTTONS   = osd_btn;
 
 assign VIDEO_ARX = status[17] ? 8'd16 : 8'd10;	// 320/32
 assign VIDEO_ARY = status[17] ? 8'd9  : 8'd7;	// 224/32
@@ -196,13 +202,6 @@ assign VIDEO_ARY = status[17] ? 8'd9  : 8'd7;	// 224/32
 //  :	status[14]		Manual Reset
 //  :	status[20:15]  OSD options
 
-// cfg bits:
-//  cfg[27:24] Special chip type, 0=None, 1=PRO-CT0, 2=Link MCU, 3=NEO-CMC
-//  cfg[23]    Use PCM chip or not
-//  cfg[31:28] Quirk, Sprite tile # remap hack, 0=no remap, 1=kof95, 2=whp, 3=kizuna
-
-`include "build_id.v"
-
 // Conditional modification of the CONF strings chaining according to chosen system type
 // Con Arc CD CDz
 // 00  01  10 11
@@ -212,6 +211,7 @@ assign VIDEO_ARY = status[17] ? 8'd9  : 8'd7;	// 224/32
 // +   O   +  +  SYSTEM_MVS; 
 // +   +   O  O  SYSTEM_CDx;   
 
+`include "build_id.v"
 localparam CONF_STR = {
 	"NEOGEO;;",
 	"-;",
@@ -224,6 +224,7 @@ localparam CONF_STR = {
 	"H3OS,PSG,ON,OFF;",
 	"H3-;",
 	"O12,System Type,Console(AES),Arcade(MVS);", //,CD,CDZ;",
+	"OM,BIOS,UniBIOS,Original;",
 	"O3,Video Mode,NTSC,PAL;",
 	"-;",
 	"H0O4,Memory Card,Plugged,Unplugged;",
@@ -241,12 +242,6 @@ localparam CONF_STR = {
 	"OH,Aspect Ratio,Original,Wide;",
 	"OIK,Scandoubler Fx,None,HQ2x,CRT 25%,CRT 50%,CRT 75%;",
 	"O56,Stereo Mix,none,25%,50%,100%;",
-	"-;",
-`ifdef DUAL_SDRAM
-	"OD,Primary SDRAM,32MB,64MB;",
-`else
-	"OD,SDRAM,32MB,64MB;",
-`endif
 	"-;",
 	"RE,Reset & apply;",  // decouple manual reset from system reset 
 	"J1,A,B,C,D,Start,Select,Coin,ABC;",	// ABC is a special key to press A+B+C at once, useful for
@@ -281,7 +276,7 @@ reg nRESET;
 always @(posedge CLK_24M) begin
 	nRESET <= &TRASH_ADDR;
 	if (~&TRASH_ADDR) TRASH_ADDR <= TRASH_ADDR + 1'b1;
-	if (ioctl_download | status[0] | status[14] | buttons[1] | bk_loading) begin
+	if (ioctl_download | status[0] | status[14] | buttons[1] | bk_loading | RESET) begin
 		TRASH_ADDR <= 0;
 		SYSTEM_TYPE <= status[2:1];	// Latch the system type on reset
 	end
@@ -290,6 +285,18 @@ end
 reg [1:0] counter_p = 0;
 always @(posedge clk_sys) counter_p <= counter_p + 1'd1;
 
+reg osd_btn = 0;
+always @(posedge CLK_24M) begin
+	integer timeout = 0;
+	
+	if(!RESET) begin
+		osd_btn <= 0;
+		if(timeout < 24000000) begin
+			timeout <= timeout + 1;
+			osd_btn <= 1;
+		end
+	end
+end
 
 //////////////////   HPS I/O   ///////////////////
 
@@ -331,6 +338,8 @@ wire  [7:0] ioctl_index;
 wire SYSTEM_MVS = (SYSTEM_TYPE == 2'd1);
 wire SYSTEM_CDx = SYSTEM_TYPE[1];
 
+wire [15:0] sdram_sz;
+
 hps_io #(.STRLEN($size(CONF_STR)>>3), .WIDE(1), .VDNUM(2)) hps_io
 (
 	.clk_sys(clk_sys),
@@ -344,9 +353,10 @@ hps_io #(.STRLEN($size(CONF_STR)>>3), .WIDE(1), .VDNUM(2)) hps_io
 	.ps2_key(ps2_key),
 
 	.status(status),				// status read (32 bits)
-	.status_menumask({~dbg_menu,~SYSTEM_MVS,~SYSTEM_CDx,SYSTEM_CDx}),
+	.status_menumask({status[22], 11'd0, ~dbg_menu,~SYSTEM_MVS,~SYSTEM_CDx,SYSTEM_CDx}),
 
 	.RTC(rtc),
+	.sdram_sz(sdram_sz),
 	
 	// Loading signals
 	.ioctl_wr(ioctl_wr),
@@ -816,10 +826,9 @@ end
 		.SDRAM_READY(sdram_ready)
 	);
 	
-	reg  sdr_pri_64;
-	wire sdr_pri_sel   = ~sdram_addr[26] & (~sdram_addr[25] | sdr_pri_64);
-	wire sdr_pri_cpsel = ~sdr_cpaddr[26] & (~sdr_cpaddr[25] | sdr_pri_64);
-	always @(posedge clk_sys) if (~nRESET) sdr_pri_64 <= status[13];
+	reg  [1:0] sdr_pri_128_64;
+	wire sdr_pri_cpsel = (~sdr_cpaddr[26] | sdr_pri_128_64[1]) & (~sdr_cpaddr[25] | sdr_pri_128_64[0]);
+	always @(posedge clk_sys) if (~nRESET) sdr_pri_128_64 <= {~sdram_sz[14] & &sdram_sz[1:0], ~sdram_sz[14] & sdram_sz[1]};
 
 	wire sdram1_ready, sdram2_ready;
 	wire [63:0] sdram1_dout, sdram2_dout;
@@ -839,7 +848,7 @@ end
 
 		.init(~locked),	// Init SDRAM as soon as the PLL is locked
 		.clk(clk_sys),
-		.addr(sdram_addr[25:1]),
+		.addr(sdram_addr[26:1]),
 		.sel(sdr_pri_sel),
 		.dout(sdram1_dout),
 		.din(sdram_din),
@@ -850,7 +859,7 @@ end
 		.ready(sdram1_ready),
 
 		.cpsel(sdr_pri_cpsel),
-		.cpaddr(sdr_cpaddr[25:1]),
+		.cpaddr(sdr_cpaddr[26:1]),
 		.cpdin(sdr_cpdin),
 		.cprd(sdr1_cprd),
 		.cpreq(sdr_cpreq),
@@ -888,8 +897,10 @@ end
 		.cpbusy(sdr2_cpbusy)
 	);
 
-	assign sdr2_en = SDRAM2_EN;
+	wire sdr_pri_sel = (~sdram_addr[26] | sdr_pri_128_64[1]) & (~sdram_addr[25] | sdr_pri_128_64[0]);
+	assign sdr2_en   = SDRAM2_EN;
 `else
+	wire   sdr_pri_sel = 1;
 	assign sdram2_dout = '0;
 	assign sdram2_ready = 1;
 	assign sdr2_cprd = 0;
@@ -1080,13 +1091,6 @@ end
 	assign sd_buff_din = SYSTEM_CDx ? sd_buff_din_memcard :
 								sd_lba[7] ? sd_buff_din_memcard : sd_buff_din_sram;
 	
-	// Cartridge stuff
-	/*gap_hack GAPHACK(
-		{C_LATCH_EXT, C_LATCH[19:4]},
-		C_LATCH[3:0],
-		status[29:28],
-		CROM_ADDR
-	);*/
 	assign CROM_ADDR = {C_LATCH_EXT, C_LATCH, 3'b000} & CROM_MASK;
 
 	zmc ZMC(
@@ -1378,6 +1382,7 @@ end
 	// To trigger a read request, just set adpcm_rd to ~adpcm_rdack
 	
 	reg ADPCMA_READ_REQ, ADPCMB_READ_REQ;
+	reg ADPCMA_READ_ACK, ADPCMB_READ_ACK;
 	reg [24:0] ADPCMA_ADDR_LATCH;	// 32MB
 	reg [24:0] ADPCMB_ADDR_LATCH;	// 32MB
 	
@@ -1413,12 +1418,12 @@ end
 		.rdaddr(ADPCMA_ADDR_LATCH),
 		.dout(ADPCMA_DATA),
 		.rd_req(ADPCMA_READ_REQ),
-		.rd_ack(),
+		.rd_ack(ADPCMA_READ_ACK),
 
 		.rdaddr2(ADPCMB_ADDR_LATCH),
 		.dout2(ADPCMB_DATA),
 		.rd_req2(ADPCMB_READ_REQ),
-		.rd_ack2(),
+		.rd_ack2(ADPCMB_READ_ACK),
 
 		.rdaddr3({7'b10_0000_0,MA & MROM_MASK[18:11],SDA[10:0]}),
 		.dout3(M1_ROM_DATA),
@@ -1537,7 +1542,7 @@ end
 
 	jt10 YM2610(
 		.rst(~nRESET),
-		.clk(CLK_8M), .cen(1),
+		.clk(CLK_8M), .cen(~(ADPCMA_READ_REQ ^ ADPCMA_READ_ACK) & ~(ADPCMB_READ_REQ ^ ADPCMB_READ_ACK)),
 		.addr(SDA[1:0]),
 		.din(SDD_OUT), .dout(YM2610_DOUT),
 		.cs_n(n2610CS), .wr_n(n2610WR),
@@ -1651,7 +1656,7 @@ end
 		old_clk <= CLK_6MB;
 		if(~old_clk & CLK_6MB) begin
 			ce_pix <= 1;
-			PAL_RAM_REG <= (nRESET && VIDEO_EN && ((pxcnt >= 7 && pxcnt < 311) || ~status[16])) ? PAL_RAM_DATA : 16'h0000;
+			PAL_RAM_REG <= (nRESET && VIDEO_EN && ((pxcnt >= 7 && pxcnt < 311) || ~status[16])) ? PAL_RAM_DATA : 16'h8000;
 		end
 
 		if(ce_pix) begin
@@ -1676,7 +1681,7 @@ end
 			
 			if(~nBNKB) vblcnt <= vblcnt+1'd1;
 			if(old_vbl & ~nBNKB) vblcnt <= 0;
-			if(~old_vbl & nBNKB) vspos <= (vblcnt>>1) - 8'd10;
+			if(~old_vbl & nBNKB) vspos <= (vblcnt>>1) - 8'd7;
 
 			{VSync,vbl} <= {vbl,1'b0};
 			if(vblcnt == vspos) {VSync,vbl} <= '1;
@@ -1690,17 +1695,24 @@ end
 
 	wire [2:0] scale = status[20:18];
 
+	wire [6:0] R6 = {1'b0, PAL_RAM_REG[11:8], PAL_RAM_REG[14], PAL_RAM_REG[11]} - PAL_RAM_REG[15];
+	wire [6:0] G6 = {1'b0, PAL_RAM_REG[7:4],  PAL_RAM_REG[13], PAL_RAM_REG[7] } - PAL_RAM_REG[15];
+	wire [6:0] B6 = {1'b0, PAL_RAM_REG[3:0],  PAL_RAM_REG[12], PAL_RAM_REG[3] } - PAL_RAM_REG[15];
+
+	wire [7:0] R8 = R6[6] ? 8'd0 : {R6[5:0],  R6[5:4]};
+	wire [7:0] G8 = G6[6] ? 8'd0 : {G6[5:0],  G6[5:4]};
+	wire [7:0] B8 = B6[6] ? 8'd0 : {B6[5:0],  B6[5:4]};
+
 	wire [7:0] r,g,b;
 	wire hs,vs,hblank,vblank;
-
 	video_cleaner video_cleaner
 	(
 		.clk_vid(clk_sys),
 		.ce_pix(ce_pix),
 
-		.R({PAL_RAM_REG[11:8], PAL_RAM_REG[14], {3{PAL_RAM_REG[15]}}}),
-		.G({PAL_RAM_REG[7:4],  PAL_RAM_REG[13], {3{PAL_RAM_REG[15]}}}),
-		.B({PAL_RAM_REG[3:0],  PAL_RAM_REG[12], {3{PAL_RAM_REG[15]}}}),
+		.R(~SHADOW ? R8 : {1'b0, R8[7:1]}),
+		.G(~SHADOW ? G8 : {1'b0, G8[7:1]}),
+		.B(~SHADOW ? B8 : {1'b0, B8[7:1]}),
 
 		.HSync(HSync),
 		.VSync(VSync),
